@@ -24,11 +24,14 @@ stellane new my-game-server --template authserver-rest-jwt
 # Run your server
 cd my-game-server
 stellane run
-Why Choose Stellane?
+```
+## Why Choose Stellane?
 Unlike NestJS (JavaScript, slow runtime), Spring (heavy JVM), or Rust (limited templates), Stellane delivers native performance, lightweight binaries, and a rich template ecosystem tailored for game servers and real-time apps.
 Join us to redefine C++ backend development! 🌟
-Contributing
+
+## Contributing
 We welcome contributions! Check out our Contributing Guide and join the Stellane community.
-License
+
+## License
 MIT License
----
+
