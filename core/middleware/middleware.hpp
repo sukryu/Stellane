@@ -1,515 +1,650 @@
-#include <iostream>
-#include <vector>
+#pragma once
+
 #include <functional>
-#include <unordered_map>
-#include <string>
+#include <vector>
 #include <memory>
-#include <chrono> // For high_resolution_clock
-#include <ctime>  // For std::time
-#include <mutex>  // For std::mutex in rate_limit
+#include <string>
+#include <optional>
+#include <chrono>
+#include <iostream>
+#include <atomic>
+#include <regex>
+#include <shared_mutex>
+#include <unordered_map>
+#include <future>
+#include <expected>
 
-// --- Request 및 Response 구조체 캡슐화 강화 ---
-struct Request {
-private:
-    std::string method_;
-    std::string path_;
-    std::string version_;
-    std::unordered_map<std::string, std::string> headers_;
-    std::vector<char> body_;
-    bool is_websocket_ = false;
-
-public:
-    // Constructor (optional, but good practice)
-    Request() = default;
-    Request(std::string method, std::string path, std::string version = "HTTP/1.1")
-        : method_(std::move(method)), path_(std::move(path)), version_(std::move(version)) {}
-
-    // Getters
-    const std::string& get_method() const { return method_; }
-    const std::string& get_path() const { return path_; }
-    const std::string& get_version() const { return version_; }
-    bool is_websocket() const { return is_websocket_; }
-
-    std::string get_header(const std::string& key) const {
-        auto it = headers_.find(key);
-        return it != headers_.end() ? it->second : "";
-    }
-
-    const std::vector<char>& get_body_raw() const { return body_; }
-    std::string get_body_string() const { return std::string(body_.begin(), body_.end()); }
-
-    // Setters
-    void set_method(std::string method) { method_ = std::move(method); }
-    void set_path(std::string path) { path_ = std::move(path); }
-    void set_version(std::string version) { version_ = std::move(version); }
-    void set_websocket(bool ws) { is_websocket_ = ws; }
-
-    void set_header(const std::string& key, const std::string& value) {
-        headers_[key] = value;
-    }
-
-    void set_body(const std::string& content) {
-        body_.assign(content.begin(), content.end());
-    }
-    void set_body_raw(const std::vector<char>& content) {
-        body_ = content;
-    }
-    void set_body_raw(std::vector<char>&& content) {
-        body_ = std::move(content);
-    }
-
-    // Clear state for object pooling
-    void clear() {
-        method_.clear();
-        path_.clear();
-        version_.clear();
-        headers_.clear();
-        body_.clear();
-        is_websocket_ = false;
-    }
-};
-
-struct Response {
-private:
-    int status_code_ = 200;
-    std::string status_message_ = "OK";
-    std::unordered_map<std::string, std::string> headers_;
-    std::vector<char> body_;
-
-public:
-    // Getters
-    int get_status_code() const { return status_code_; }
-    const std::string& get_status_message() const { return status_message_; }
-
-    std::string get_header(const std::string& key) const {
-        auto it = headers_.find(key);
-        return it != headers_.end() ? it->second : "";
-    }
-
-    const std::vector<char>& get_body_raw() const { return body_; }
-    std::string get_body_string() const { return std::string(body_.begin(), body_.end()); }
-
-
-    // Setters
-    void set_status(int code, const std::string& message) {
-        status_code_ = code;
-        status_message_ = message;
-    }
-
-    void set_header(const std::string& key, const std::string& value) {
-        headers_[key] = value;
-    }
-
-    void set_body(const std::string& content) {
-        body_.assign(content.begin(), content.end());
-        set_header("Content-Length", std::to_string(content.length()));
-    }
-    void set_body_raw(const std::vector<char>& content) {
-        body_ = content;
-        set_header("Content-Length", std::to_string(content.size()));
-    }
-    void set_body_raw(std::vector<char>&& content) {
-        size_t size = content.size();
-        body_ = std::move(content);
-        set_header("Content-Length", std::to_string(size));
-    }
-
-    void set_json(const std::string& json_content) {
-        set_header("Content-Type", "application/json");
-        set_body(json_content);
-    }
-
-    // Clear state for object pooling
-    void clear() {
-        status_code_ = 200;
-        status_message_ = "OK";
-        headers_.clear();
-        body_.clear();
-    }
-};
-
-// 미들웨어 시그니처 정의
-using Middleware = std::function<void(Request&, Response&, std::function<void()>)>;
-
-// 미들웨어 체인 실행 결과를 나타내는 열거형
-enum class ChainResult {
-    COMPLETED,    // 모든 미들웨어가 성공적으로 실행됨
-    INTERRUPTED,  // 미들웨어가 next()를 호출하지 않아 중단됨
-    ERROR        // 예외 발생
-};
-
-// --- MiddlewareChain 클래스 (반복적 방식으로 개선) ---
-class MiddlewareChain {
-private:
-    std::vector<Middleware> middlewares;
-
-public:
-    void push_back(const Middleware& middleware) {
-        middlewares.push_back(middleware);
-    }
-
-    void push_back(Middleware&& middleware) {
-        middlewares.push_back(std::move(middleware));
-    }
-
-    void clear() {
-        middlewares.clear();
-    }
-
-    size_t size() const {
-        return middlewares.size();
-    }
-
-    // 체인 실행 (반복적 방식으로 스택 오버플로우 방지)
-    ChainResult handle(Request& req, Response& res) {
-        if (middlewares.empty()) {
-            return ChainResult::COMPLETED;
-        }
-        
-        try {
-            size_t current_index = 0;
-            
-            while (current_index < middlewares.size()) {
-                bool next_called = false;
-                
-                // next 함수: 다음 미들웨어로 진행
-                auto next = [&next_called]() {
-                    next_called = true;
-                };
-                
-                // 현재 미들웨어 실행
-                middlewares[current_index](req, res, next);
-                
-                // next()가 호출되지 않았으면 체인 중단
-                if (!next_called) {
-                    return ChainResult::INTERRUPTED;
-                }
-                
-                ++current_index; // 다음 미들웨어로 이동
-            }
-            
-            return ChainResult::COMPLETED; // 모든 미들웨어 성공적으로 실행됨
-            
-        } catch (const std::exception& e) {
-            std::cerr << "Exception in middleware chain: " << e.what() << std::endl;
-            // 예외 발생 시, 응답 상태를 500으로 설정
-            if (res.get_status_code() == 200) { // 아직 응답이 설정되지 않았다면
-                res.set_status(500, "Internal Server Error");
-                res.set_body("An unexpected error occurred.");
-            }
-            return ChainResult::ERROR;
-        } catch (...) {
-            std::cerr << "Unknown exception in middleware chain" << std::endl;
-            if (res.get_status_code() == 200) {
-                res.set_status(500, "Internal Server Error");
-                res.set_body("An unknown error occurred.");
-            }
-            return ChainResult::ERROR;
-        }
-    }
-};
-
-// --- Router 클래스 ---
-class Router {
-private:
-    struct Route {
-        std::string method;
-        std::string path;
-        std::function<void(Request&, Response&)> handler;
-        MiddlewareChain middleware_chain;
-    };
-
-    std::vector<Route> routes;
-    MiddlewareChain global_middleware;
-
-public:
-    void use(const Middleware& middleware) {
-        global_middleware.push_back(middleware);
-    }
-
-    void add_route(const std::string& method, const std::string& path, 
-                   std::function<void(Request&, Response&)> handler,
-                   const std::vector<Middleware>& middlewares = {}) {
-        Route route;
-        route.method = method;
-        route.path = path;
-        route.handler = std::move(handler); // Use move for handler
-        
-        for (const auto& middleware : middlewares) {
-            route.middleware_chain.push_back(middleware);
-        }
-        
-        routes.push_back(std::move(route));
-    }
-
-    void add_middleware(const std::string& method, const std::string& path, 
-                       const Middleware& middleware) {
-        for (auto& route : routes) {
-            if (route.method == method && route.path == path) {
-                route.middleware_chain.push_back(middleware);
-                return;
-            }
-        }
-        std::cerr << "Warning: Route not found for adding middleware: " << method << " " << path << std::endl;
-    }
-
-    bool handle_request(Request& req, Response& res) {
-        // 글로벌 미들웨어 먼저 실행
-        ChainResult global_result = global_middleware.handle(req, res);
-        
-        if (global_result == ChainResult::INTERRUPTED || global_result == ChainResult::ERROR) {
-            return true; // 글로벌 미들웨어가 응답을 처리했거나 오류 발생
-        }
-        
-        // 일치하는 라우트 찾기
-        for (auto& route : routes) {
-            if (route.method == req.get_method() && route.path == req.get_path()) {
-                // 라우트별 미들웨어 실행
-                ChainResult route_result = route.middleware_chain.handle(req, res);
-                
-                if (route_result == ChainResult::INTERRUPTED || route_result == ChainResult::ERROR) {
-                    return true; // 라우트 미들웨어가 응답을 처리했거나 오류 발생
-                }
-                
-                // 핸들러 실행
-                try {
-                    route.handler(req, res);
-                    return true;
-                } catch (const std::exception& e) {
-                    std::cerr << "Exception in route handler for " << req.get_method() << " " << req.get_path() << ": " << e.what() << std::endl;
-                    if (res.get_status_code() == 200) { // 아직 응답이 설정되지 않았다면
-                        res.set_status(500, "Internal Server Error");
-                        res.set_body("Handler error occurred.");
-                    }
-                    return true;
-                } catch (...) {
-                    std::cerr << "Unknown exception in route handler for " << req.get_method() << " " << req.get_path() << std::endl;
-                     if (res.get_status_code() == 200) {
-                        res.set_status(500, "Internal Server Error");
-                        res.set_body("An unknown error occurred in handler.");
-                    }
-                    return true;
-                }
-            }
-        }
-        
-        // 라우트를 찾지 못함
-        res.set_status(404, "Not Found");
-        res.set_body("Route not found");
-        return true;
-    }
-};
-
-// --- 예시 미들웨어들 ---
-namespace CommonMiddleware {
-    Middleware logging() {
-        return [](Request& req, Response& res, std::function<void()> next) {
-            auto start_time = std::chrono::high_resolution_clock::now();
-            std::time_t current_time = std::time(nullptr);
-            std::cout << "[" << current_time << "] Incoming request: " << req.get_method() << " " << req.get_path() << std::endl;
-            
-            next(); // 다음 미들웨어 또는 핸들러 실행
-            
-            auto end_time = std::chrono::high_resolution_clock::now();
-            auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
-            std::cout << "[" << current_time << "] Response for " << req.get_path() << ": " << res.get_status_code() << " (" << duration.count() << " us)" << std::endl;
-        };
-    }
-
-    Middleware cors() {
-        return [](Request& req, Response& res, std::function<void()> next) {
-            res.set_header("Access-Control-Allow-Origin", "*");
-            res.set_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-            res.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, X-Trace-Id, X-User-Position"); // Add custom headers
-            res.set_header("Access-Control-Max-Age", "86400"); // Cache preflight for 24 hours
-            
-            if (req.get_method() == "OPTIONS") {
-                res.set_status(200, "OK");
-                res.set_body("");
-                return; // next() 호출하지 않음: preflight 요청은 여기서 끝
-            }
-            
-            next();
-        };
-    }
-
-    Middleware auth() {
-        return [](Request& req, Response& res, std::function<void()> next) {
-            std::string auth_header = req.get_header("Authorization");
-            if (auth_header.empty() || auth_header != "Bearer valid-token") {
-                res.set_status(401, "Unauthorized");
-                res.set_json("{\"error\": \"Invalid or missing token\"}");
-                return; // next() 호출하지 않음
-            }
-            // 인증 성공 시 사용자 ID 등을 Request 객체에 추가할 수도 있음 (예: req.set_context("user_id", "some_id"))
-            next();
-        };
-    }
-
-    // IP 기반 속도 제한 미들웨어 (스레드 안전성 고려 및 Retry-After 헤더 추가)
-    Middleware rate_limit_per_ip(int max_requests_per_minute = 60) {
-        // 실제 구현에서는 Redis나 분산 캐시 사용 권장. 여기서는 예시를 위해 인메모리 static map 사용.
-        static std::unordered_map<std::string, std::pair<int, std::chrono::steady_clock::time_point>> ip_counters;
-        static std::mutex counter_mutex; // 스레드 안전성을 위해 추가
-
-        return [max_requests_per_minute](Request& req, Response& res, std::function<void()> next) {
-            std::string client_ip = req.get_header("X-Real-IP"); // 프록시 뒤 실제 IP
-            if (client_ip.empty()) {
-                client_ip = req.get_header("X-Forwarded-For"); // 다른 프록시 헤더
-            }
-            if (client_ip.empty()) {
-                client_ip = "127.0.0.1"; // 기본값 또는 실제 클라이언트 IP 추출 로직 필요
-            }
-            
-            std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
-            
-            std::lock_guard<std::mutex> lock(counter_mutex); // 맵 접근 시 락
-            
-            auto& [count, last_reset_time] = ip_counters[client_ip];
-            
-            // 1분(60초)마다 카운터 리셋
-            if (std::chrono::duration_cast<std::chrono::seconds>(now - last_reset_time).count() >= 60) {
-                count = 0;
-                last_reset_time = now;
-            }
-            
-            if (++count > max_requests_per_minute) {
-                res.set_status(429, "Too Many Requests");
-                res.set_json("{\"error\": \"Rate limit exceeded\", \"retry_after\": 60}");
-                res.set_header("Retry-After", "60"); // 클라이언트에게 60초 후 재시도 지시
-                return;
-            }
-            
-            next();
-        };
-    }
-
-    // --- 새로운 미들웨어: 분산 추적 미들웨어 (개념적 구현) ---
-    Middleware distributed_tracing() {
-        return [](Request& req, Response& res, std::function<void()> next) {
-            std::string trace_id = req.get_header("X-Trace-Id");
-            if (trace_id.empty()) {
-                // 실제로는 UUID 생성 라이브러리 사용
-                trace_id = "trace_" + std::to_string(std::time(nullptr)) + "_" + std::to_string(std::rand() % 1000); 
-            }
-            
-            // 요청 및 응답에 Trace ID 설정
-            req.set_header("X-Trace-Id", trace_id); // 하위 서비스 호출 시 전달용 (Request 객체는 계속 전달되므로)
-            res.set_header("X-Trace-Id", trace_id); // 응답 헤더에 Trace ID 포함
-
-            std::cout << "[Trace] Request " << req.get_path() << " Trace ID: " << trace_id << std::endl;
-            
-            auto start = std::chrono::high_resolution_clock::now();
-            next(); // 다음 미들웨어 실행
-            auto end = std::chrono::high_resolution_clock::now();
-            
-            auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-            // 실제 시스템에서는 이 정보를 로깅 시스템(예: Jaeger, Zipkin)으로 전송
-            std::cout << "[Trace] Response for " << req.get_path() << " in " << duration.count() << " us. Trace ID: " << trace_id << std::endl;
-        };
-    }
-
-    // --- 새로운 미들웨어: 메타버스 공간 필터링 (개념적 구현) ---
-    // 실제 공간 인덱스(예: 쿼드트리, R-트리)와 위치 파싱 로직 필요
-    Middleware spatial_filtering() {
-        return [](Request& req, Response& res, std::function<void()> next) {
-            std::string user_pos_str = req.get_header("X-User-Position");
-            if (user_pos_str.empty()) {
-                std::cout << "[Spatial] No user position provided." << std::endl;
-                next();
-                return;
-            }
-
-            // 예시: "x,y,z" 형식 파싱
-            // 실제로는 더 견고한 파싱 필요
-            // float x, y, z;
-            // parse_position(user_pos_str, x, y, z); 
-
-            // 개념적인 공간 쿼리 (실제 구현 필요)
-            // auto nearby_users = spatial_index.query_range({x,y,z}, message_range);
-            // req.set_context("target_users", nearby_users); // Request에 컨텍스트 저장
-
-            std::cout << "[Spatial] Processing request from position: " << user_pos_str << std::endl;
-            next();
-        };
-    }
-
-    // --- 새로운 미들웨어: 성능 모니터링 (개념적 구현) ---
-    Middleware performance_monitoring() {
-        return [](Request& req, Response& res, std::function<void()> next) {
-            auto start = std::chrono::high_resolution_clock::now();
-            
-            next();
-            
-            auto end = std::chrono::high_resolution_clock::now();
-            auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-            
-            // 실제 시스템에서는 Prometheus exporter나 StatsD 등으로 메트릭 전송
-            // record_request_duration_metric(req.get_path(), duration.count());
-            // record_status_code_metric(res.get_status_code());
-            
-            if (duration.count() > 5000) { // 5ms 초과 시 경고
-                std::cerr << "[Performance Warning] Slow request: " << req.get_method() << " " 
-                          << req.get_path() << " took " << duration.count() << " us" << std::endl;
-            } else {
-                std::cout << "[Performance] Request " << req.get_path() << " took " << duration.count() << " us" << std::endl;
-            }
-        };
-    }
+// Forward declarations
+namespace stellane {
+struct Request;
+struct Response;
+enum class NetworkError;
 }
 
-// --- ObjectPool 개념적 구현 (스레드 세이프) ---
-// 실제 서버에서는 Request/Response 객체 라이프사이클 관리가 더 복잡해질 수 있음
-class ObjectPool {
+namespace stellane {
+
+// 미들웨어 타입 정의
+using Middleware = std::function<void(Request&, Response&, std::function<void()>)>;
+using PostMiddleware = std::function<void(Request&, Response&)>; // 후처리 훅
+
+// 미들웨어 실행 결과
+enum class MiddlewareResult {
+COMPLETED,     // 모든 미들웨어가 성공적으로 실행됨
+INTERRUPTED,   // 중간에 체인이 중단됨 (next() 호출 안함)
+ERROR          // 예외 발생
+};
+
+// 미들웨어 실행 컨텍스트
+struct MiddlewareContext {
+std::chrono::steady_clock::time_point start_time;
+std::string current_middleware_name;
+std::size_t current_index = 0;
+bool chain_completed = false;
+std::optional<std::string> error_message;
+std::vector<PostMiddleware> post_hooks; // 후처리 훅들
+
+```
+// 최대 체인 깊이 제한 (스택 오버플로우 방지)
+static constexpr std::size_t MAX_CHAIN_DEPTH = 100;
+
+MiddlewareContext() : start_time(std::chrono::steady_clock::now()) {}
+
+void add_post_hook(PostMiddleware hook) {
+    post_hooks.push_back(std::move(hook));
+}
+
+void execute_post_hooks(Request& req, Response& res) {
+    for (auto& hook : post_hooks) {
+        try {
+            hook(req, res);
+        } catch (...) {
+            // 후처리 훅 실패는 무시 (로깅만)
+            std::cerr << "Post-hook execution failed" << std::endl;
+        }
+    }
+}
+```
+
+};
+
+// 미들웨어 체인 클래스 (재귀 → 반복문 전환)
+class MiddlewareChain {
+public:
+MiddlewareChain() = default;
+~MiddlewareChain() = default;
+
+```
+// 복사 생성자와 할당 연산자
+MiddlewareChain(const MiddlewareChain&) = default;
+MiddlewareChain& operator=(const MiddlewareChain&) = default;
+
+// 이동 생성자와 할당 연산자
+MiddlewareChain(MiddlewareChain&&) = default;
+MiddlewareChain& operator=(MiddlewareChain&&) = default;
+
+// 미들웨어 추가
+void push_back(Middleware middleware) {
+    middlewares_.push_back(std::move(middleware));
+}
+
+// 미들웨어 추가 (이름과 함께)
+void push_back(const std::string& name, Middleware middleware) {
+    middleware_names_.push_back(name);
+    middlewares_.push_back(std::move(middleware));
+}
+
+// 미들웨어 체인 실행 (반복문 기반으로 변경)
+MiddlewareResult handle(Request& request, Response& response) {
+    if (middlewares_.empty()) {
+        return MiddlewareResult::COMPLETED;
+    }
+    
+    if (middlewares_.size() > MiddlewareContext::MAX_CHAIN_DEPTH) {
+        std::cerr << "Middleware chain too deep: " << middlewares_.size() << std::endl;
+        return MiddlewareResult::ERROR;
+    }
+    
+    MiddlewareContext context;
+    return execute_chain_iterative(request, response, context);
+}
+
+// 미들웨어 체인 크기
+std::size_t size() const {
+    return middlewares_.size();
+}
+
+// 미들웨어 체인이 비어있는지 확인
+bool empty() const {
+    return middlewares_.empty();
+}
+
+// 미들웨어 체인 초기화
+void clear() {
+    middlewares_.clear();
+    middleware_names_.clear();
+}
+
+// 디버깅용 미들웨어 이름 목록 반환
+std::vector<std::string> get_middleware_names() const {
+    return middleware_names_;
+}
+```
+
 private:
-    std::vector<std::unique_ptr<Request>> request_pool_;
-    std::vector<std::unique_ptr<Response>> response_pool_;
-    std::mutex request_mutex_;
-    std::mutex response_mutex_;
-    size_t initial_size_;
+std::vector<Middleware> middlewares_;
+std::vector<std::string> middleware_names_;
+
+```
+// 반복문 기반 체인 실행 (스택 오버플로우 방지)
+MiddlewareResult execute_chain_iterative(Request& request, Response& response, 
+                                       MiddlewareContext& context) {
+    std::vector<bool> middleware_completed(middlewares_.size(), false);
+    std::size_t current_index = 0;
+    
+    while (current_index < middlewares_.size()) {
+        context.current_index = current_index;
+        
+        // 미들웨어 이름 설정
+        if (current_index < middleware_names_.size()) {
+            context.current_middleware_name = middleware_names_[current_index];
+        } else {
+            context.current_middleware_name = "middleware_" + std::to_string(current_index);
+        }
+        
+        bool next_called = false;
+        bool should_continue = true;
+        
+        try {
+            // next 함수 정의
+            auto next = [&next_called, &should_continue]() {
+                if (next_called) {
+                    return; // 중복 호출 방지
+                }
+                next_called = true;
+                should_continue = true;
+            };
+            
+            // 현재 미들웨어 실행
+            middlewares_[current_index](request, response, next);
+            middleware_completed[current_index] = true;
+            
+            if (!next_called) {
+                // next()가 호출되지 않았으면 체인 중단
+                context.execute_post_hooks(request, response);
+                return MiddlewareResult::INTERRUPTED;
+            }
+            
+            current_index++;
+            
+        } catch (const std::exception& e) {
+            context.error_message = std::string("Error in ") + context.current_middleware_name + ": " + e.what();
+            return MiddlewareResult::ERROR;
+        } catch (...) {
+            context.error_message = std::string("Unknown error in ") + context.current_middleware_name;
+            return MiddlewareResult::ERROR;
+        }
+    }
+    
+    context.chain_completed = true;
+    context.execute_post_hooks(request, response);
+    return MiddlewareResult::COMPLETED;
+}
+```
+
+};
+
+// 패턴 매칭 지원 미들웨어 체인
+class PatternMiddlewareChain {
+public:
+struct PatternEntry {
+std::string pattern;
+std::regex regex;
+std::unique_ptr<MiddlewareChain> chain;
+
+```
+    PatternEntry(const std::string& p) : pattern(p), regex(p), chain(std::make_unique<MiddlewareChain>()) {}
+};
+
+void add_pattern(const std::string& pattern, const std::string& name, Middleware middleware) {
+    auto it = std::find_if(patterns_.begin(), patterns_.end(),
+                          [&pattern](const PatternEntry& entry) {
+                              return entry.pattern == pattern;
+                          });
+    
+    if (it == patterns_.end()) {
+        patterns_.emplace_back(pattern);
+        it = patterns_.end() - 1;
+    }
+    
+    it->chain->push_back(name, std::move(middleware));
+}
+
+MiddlewareResult handle(const std::string& path, Request& request, Response& response) {
+    for (const auto& entry : patterns_) {
+        if (std::regex_match(path, entry.regex)) {
+            return entry.chain->handle(request, response);
+        }
+    }
+    return MiddlewareResult::COMPLETED;
+}
+
+void clear() {
+    patterns_.clear();
+}
+```
+
+private:
+std::vector<PatternEntry> patterns_;
+};
+
+// 미들웨어 팩토리 클래스 - 확장된 버전
+class MiddlewareFactory {
+public:
+// 로깅 미들웨어 (후처리 훅 포함)
+static Middleware create_logger(const std::string& prefix = “[REQUEST]”) {
+return [prefix](Request& req, Response& res, std::function<void()> next) {
+auto start = std::chrono::steady_clock::now();
+
+```
+        std::cout << prefix << " " << req.method << " " << req.path;
+        if (!req.query_string.empty()) {
+            std::cout << "?" << req.query_string;
+        }
+        std::cout << std::endl;
+        
+        next();
+        
+        auto end = std::chrono::steady_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+        
+        std::cout << prefix << " Response: " << res.status_code 
+                  << " (" << duration.count() << "ms)" << std::endl;
+    };
+}
+
+// CORS 미들웨어
+static Middleware create_cors(const std::string& origin = "*") {
+    return [origin](Request& req, Response& res, std::function<void()> next) {
+        res.headers["Access-Control-Allow-Origin"] = origin;
+        res.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS";
+        res.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization";
+        
+        if (req.method == "OPTIONS") {
+            res.status_code = 200;
+            res.body = "";
+            return;
+        }
+        
+        next();
+    };
+}
+
+// 경로 패턴 기반 필터 미들웨어
+static Middleware create_path_pattern_filter(const std::string& blocked_pattern, 
+                                           int status_code = 403, 
+                                           const std::string& message = "Access Denied") {
+    return [blocked_pattern, status_code, message](Request& req, Response& res, std::function<void()> next) {
+        std::regex pattern(blocked_pattern);
+        if (std::regex_match(req.path, pattern)) {
+            res.status_code = status_code;
+            res.body = "{\"error\": \"" + message + "\"}";
+            res.headers["content-type"] = "application/json";
+            return;
+        }
+        next();
+    };
+}
+
+// JWT 인증 미들웨어 (간단한 Bearer token 검증)
+static Middleware create_jwt_auth(const std::string& secret_key) {
+    return [secret_key](Request& req, Response& res, std::function<void()> next) {
+        auto auth_header = req.headers.find("Authorization");
+        if (auth_header == req.headers.end()) {
+            res.status_code = 401;
+            res.body = "{\"error\": \"Authorization header missing\"}";
+            res.headers["content-type"] = "application/json";
+            return;
+        }
+        
+        std::string token = auth_header->second;
+        if (token.substr(0, 7) != "Bearer ") {
+            res.status_code = 401;
+            res.body = "{\"error\": \"Invalid token format\"}";
+            res.headers["content-type"] = "application/json";
+            return;
+        }
+        
+        // 실제 JWT 검증 로직은 여기서 구현
+        // 현재는 단순 비교로 대체
+        if (token.substr(7) != secret_key) {
+            res.status_code = 401;
+            res.body = "{\"error\": \"Invalid token\"}";
+            res.headers["content-type"] = "application/json";
+            return;
+        }
+        
+        next();
+    };
+}
+
+// Rate Limiting 미들웨어
+static Middleware create_rate_limiter(std::size_t max_requests_per_minute = 100) {
+    // 간단한 in-memory rate limiter (실제로는 Redis 등 사용)
+    static std::unordered_map<std::string, std::vector<std::chrono::steady_clock::time_point>> client_requests;
+    static std::mutex rate_limit_mutex;
+    
+    return [max_requests_per_minute](Request& req, Response& res, std::function<void()> next) {
+        std::lock_guard<std::mutex> lock(rate_limit_mutex);
+        
+        // 클라이언트 IP 추출 (실제로는 req.client_ip 등 사용)
+        std::string client_id = req.headers.count("X-Forwarded-For") ? 
+                              req.headers.at("X-Forwarded-For") : "unknown";
+        
+        auto now = std::chrono::steady_clock::now();
+        auto& requests = client_requests[client_id];
+        
+        // 1분 이전 요청들 제거
+        requests.erase(
+            std::remove_if(requests.begin(), requests.end(),
+                          [now](const auto& time_point) {
+                              return std::chrono::duration_cast<std::chrono::minutes>(now - time_point).count() >= 1;
+                          }),
+            requests.end()
+        );
+        
+        if (requests.size() >= max_requests_per_minute) {
+            res.status_code = 429;
+            res.body = "{\"error\": \"Rate limit exceeded\"}";
+            res.headers["content-type"] = "application/json";
+            res.headers["Retry-After"] = "60";
+            return;
+        }
+        
+        requests.push_back(now);
+        next();
+    };
+}
+
+// 요청 크기 제한 미들웨어
+static Middleware create_body_size_limit(std::size_t max_size_bytes) {
+    return [max_size_bytes](Request& req, Response& res, std::function<void()> next) {
+        if (req.body.size() > max_size_bytes) {
+            res.status_code = 413;
+            res.body = "{\"error\": \"Request body too large\"}";
+            res.headers["content-type"] = "application/json";
+            return;
+        }
+        next();
+    };
+}
+
+// 응답 시간 측정 미들웨어 (후처리 훅 사용)
+static Middleware create_timing_middleware(const std::string& header_name = "X-Response-Time") {
+    return [header_name](Request& req, Response& res, std::function<void()> next) {
+        auto start = std::chrono::steady_clock::now();
+        
+        next();
+        
+        auto end = std::chrono::steady_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+        
+        res.headers[header_name] = std::to_string(duration.count()) + "ms";
+    };
+}
+
+// 보안 헤더 미들웨어
+static Middleware create_security_headers() {
+    return [](Request& req, Response& res, std::function<void()> next) {
+        next();
+        
+        // 보안 헤더 추가
+        res.headers["X-Content-Type-Options"] = "nosniff";
+        res.headers["X-Frame-Options"] = "DENY";
+        res.headers["X-XSS-Protection"] = "1; mode=block";
+        res.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains";
+    };
+}
+```
+
+};
+
+// 미들웨어 결과를 문자열로 변환
+std::string middleware_result_to_string(MiddlewareResult result) {
+switch (result) {
+case MiddlewareResult::COMPLETED:
+return “COMPLETED”;
+case MiddlewareResult::INTERRUPTED:
+return “INTERRUPTED”;
+case MiddlewareResult::ERROR:
+return “ERROR”;
+default:
+return “UNKNOWN”;
+}
+}
+
+// Router 클래스 확장 - 개선된 미들웨어 기능
+class RouterWithMiddleware {
+private:
+Router base_router_;
+MiddlewareChain global_middleware_chain_;
+PatternMiddlewareChain pattern_middleware_chain_;
+std::unordered_map<std::string, std::unique_ptr<MiddlewareChain>> route_specific_chains_;
+mutable std::shared_mutex middleware_mutex_;
+
+```
+struct MiddlewareMetrics {
+    std::atomic<uint64_t> total_middleware_executions{0};
+    std::atomic<uint64_t> interrupted_chains{0};
+    std::atomic<uint64_t> error_chains{0};
+    std::atomic<uint64_t> avg_middleware_time_ns{0};
+    std::atomic<uint64_t> pattern_matches{0};
+} middleware_metrics_;
+```
 
 public:
-    explicit ObjectPool(size_t initial_size = 100) : initial_size_(initial_size) {
-        for (size_t i = 0; i < initial_size_; ++i) {
-            request_pool_.push_back(std::make_unique<Request>());
-            response_pool_.push_back(std::make_unique<Response>());
-        }
-    }
+RouterWithMiddleware() = default;
 
-    std::unique_ptr<Request> get_request() {
-        std::lock_guard<std::mutex> lock(request_mutex_);
-        if (!request_pool_.empty()) {
-            auto req = std::move(request_pool_.back());
-            request_pool_.pop_back();
-            req->clear(); // Reuse: clear previous state
-            return req;
-        }
-        return std::make_unique<Request>(); // Pool empty, create new
+```
+// 글로벌 미들웨어 추가
+void add_global_middleware(Middleware middleware) {
+    std::unique_lock lock(middleware_mutex_);
+    global_middleware_chain_.push_back(std::move(middleware));
+}
+
+void add_global_middleware(const std::string& name, Middleware middleware) {
+    std::unique_lock lock(middleware_mutex_);
+    global_middleware_chain_.push_back(name, std::move(middleware));
+}
+
+// 패턴 기반 미들웨어 추가
+void add_pattern_middleware(const std::string& pattern, const std::string& name, Middleware middleware) {
+    std::unique_lock lock(middleware_mutex_);
+    pattern_middleware_chain_.add_pattern(pattern, name, std::move(middleware));
+}
+
+// 특정 경로에 대한 미들웨어 추가
+void add_route_middleware(const std::string& method, const std::string& path, 
+                        Middleware middleware) {
+    std::unique_lock lock(middleware_mutex_);
+    std::string route_key = method + ":" + path;
+    
+    if (route_specific_chains_.find(route_key) == route_specific_chains_.end()) {
+        route_specific_chains_[route_key] = std::make_unique<MiddlewareChain>();
     }
     
-    void return_request(std::unique_ptr<Request> req) {
-        if (!req) return;
-        std::lock_guard<std::mutex> lock(request_mutex_);
-        req->clear(); // Clear state before returning to pool
-        request_pool_.push_back(std::move(req));
-    }
+    route_specific_chains_[route_key]->push_back(std::move(middleware));
+}
 
-    std::unique_ptr<Response> get_response() {
-        std::lock_guard<std::mutex> lock(response_mutex_);
-        if (!response_pool_.empty()) {
-            auto res = std::move(response_pool_.back());
-            response_pool_.pop_back();
-            res->clear(); // Reuse: clear previous state
-            return res;
-        }
-        return std::make_unique<Response>(); // Pool empty, create new
+void add_route_middleware(const std::string& method, const std::string& path, 
+                        const std::string& name, Middleware middleware) {
+    std::unique_lock lock(middleware_mutex_);
+    std::string route_key = method + ":" + path;
+    
+    if (route_specific_chains_.find(route_key) == route_specific_chains_.end()) {
+        route_specific_chains_[route_key] = std::make_unique<MiddlewareChain>();
     }
     
-    void return_response(std::unique_ptr<Response> res) {
-        if (!res) return;
-        std::lock_guard<std::mutex> lock(response_mutex_);
-        res->clear(); // Clear state before returning to pool
-        response_pool_.push_back(std::move(res));
-    }
+    route_specific_chains_[route_key]->push_back(name, std::move(middleware));
+}
+
+// 기존 Router 메서드들을 위임
+template<typename Func>
+void get(const std::string& path, Func&& handler) {
+    base_router_.get(path, std::forward<Func>(handler));
+}
+
+template<typename Func>
+void post(const std::string& path, Func&& handler) {
+    base_router_.post(path, std::forward<Func>(handler));
+}
+
+template<typename Func>
+void put(const std::string& path, Func&& handler) {
+    base_router_.put(path, std::forward<Func>(handler));
+}
+
+template<typename Func>
+void del(const std::string& path, Func&& handler) {
+    base_router_.del(path, std::forward<Func>(handler));
+}
+
+// 미들웨어를 적용한 요청 처리 (move 시맨틱 적용)
+std::future<std::expected<Response, NetworkError>> dispatch(Request&& request) {
+    return std::async(std::launch::async, [this, req = std::move(request)]() -> std::expected<Response, NetworkError> {
+        auto start_time = std::chrono::high_resolution_clock::now();
+        middleware_metrics_.total_middleware_executions++;
+        
+        // Request를 mutable로 처리
+        Request mutable_request = std::move(req);
+        Response response;
+        
+        // 글로벌 미들웨어 실행
+        MiddlewareResult global_result;
+        {
+            std::shared_lock lock(middleware_mutex_);
+            global_result = global_middleware_chain_.handle(mutable_request, response);
+        }
+        
+        if (global_result == MiddlewareResult::INTERRUPTED) {
+            middleware_metrics_.interrupted_chains++;
+            return response;
+        }
+        
+        if (global_result == MiddlewareResult::ERROR) {
+            middleware_metrics_.error_chains++;
+            return Response::internal_error();
+        }
+        
+        // 패턴 미들웨어 실행
+        {
+            std::shared_lock lock(middleware_mutex_);
+            auto pattern_result = pattern_middleware_chain_.handle(mutable_request.path, mutable_request, response);
+            
+            if (pattern_result == MiddlewareResult::INTERRUPTED) {
+                middleware_metrics_.interrupted_chains++;
+                middleware_metrics_.pattern_matches++;
+                return response;
+            }
+            
+            if (pattern_result == MiddlewareResult::ERROR) {
+                middleware_metrics_.error_chains++;
+                return Response::internal_error();
+            }
+        }
+        
+        // 경로별 미들웨어 실행
+        std::string route_key = mutable_request.method + ":" + mutable_request.path;
+        {
+            std::shared_lock lock(middleware_mutex_);
+            auto route_chain_it = route_specific_chains_.find(route_key);
+            if (route_chain_it != route_specific_chains_.end()) {
+                auto route_result = route_chain_it->second->handle(mutable_request, response);
+                
+                if (route_result == MiddlewareResult::INTERRUPTED) {
+                    middleware_metrics_.interrupted_chains++;
+                    return response;
+                }
+                
+                if (route_result == MiddlewareResult::ERROR) {
+                    middleware_metrics_.error_chains++;
+                    return Response::internal_error();
+                }
+            }
+        }
+        
+        // 기존 라우터로 요청 전달
+        auto future_response = base_router_.dispatch(std::move(mutable_request));
+        auto router_result = future_response.get();
+        
+        if (!router_result.has_value()) {
+            return std::unexpected(router_result.error());
+        }
+        
+        // 미들웨어 실행 시간 기록
+        auto end_time = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - start_time);
+        
+        uint64_t current_avg = middleware_metrics_.avg_middleware_time_ns.load();
+        uint64_t new_avg = (current_avg + duration.count()) / 2;
+        middleware_metrics_.avg_middleware_time_ns.store(new_avg);
+        
+        return router_result.value();
+    });
+}
+
+// 미들웨어 관련 메트릭스
+struct MiddlewareMetrics {
+    uint64_t total_middleware_executions;
+    uint64_t interrupted_chains;
+    uint64_t error_chains;
+    uint64_t avg_middleware_time_ns;
+    uint64_t pattern_matches;
+    double interruption_rate;
+    double error_rate;
 };
+
+MiddlewareMetrics get_middleware_metrics() const {
+    return MiddlewareMetrics{
+        middleware_metrics_.total_middleware_executions.load(),
+        middleware_metrics_.interrupted_chains.load(),
+        middleware_metrics_.error_chains.load(),
+        middleware_metrics_.avg_middleware_time_ns.load(),
+        middleware_metrics_.pattern_matches.load(),
+        static_cast<double>(middleware_metrics_.interrupted_chains.load()) / 
+            std::max(1ULL, middleware_metrics_.total_middleware_executions.load()),
+        static_cast<double>(middleware_metrics_.error_chains.load()) / 
+            std::max(1ULL, middleware_metrics_.total_middleware_executions.load())
+    };
+}
+
+// 설정 기반 미들웨어 로드
+void load_middleware_config(const std::string& config_path) {
+    // Config 파일에서 미들웨어 설정 로드
+    // 실제 구현에서는 TOML/JSON 파서 사용
+    
+    // 예시 구성:
+    add_global_middleware("logger", MiddlewareFactory::create_logger());
+    add_global_middleware("cors", MiddlewareFactory::create_cors());
+    add_global_middleware("security", MiddlewareFactory::create_security_headers());
+    add_global_middleware("rate_limit", MiddlewareFactory::create_rate_limiter(100));
+    
+    // 패턴 기반 미들웨어
+    add_pattern_middleware("/api/admin/.*", "admin_auth", 
+                         MiddlewareFactory::create_jwt_auth("admin_secret"));
+    add_pattern_middleware("/api/.*", "api_auth", 
+                         MiddlewareFactory::create_jwt_auth("api_secret"));
+}
+
+// 미들웨어 체인 초기화
+void clear_all_middleware() {
+    std::unique_lock lock(middleware_mutex_);
+    global_middleware_chain_.clear();
+    pattern_middleware_chain_.clear();
+    route_specific_chains_.clear();
+}
+```
+
+};
+
+} // namespace stellane
 
