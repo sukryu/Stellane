@@ -43,7 +43,6 @@ bool chain_completed = false;
 std::optional<std::string> error_message;
 std::vector<PostMiddleware> post_hooks; // 후처리 훅들
 
-```
 // 최대 체인 깊이 제한 (스택 오버플로우 방지)
 static constexpr std::size_t MAX_CHAIN_DEPTH = 100;
 
@@ -63,7 +62,6 @@ void execute_post_hooks(Request& req, Response& res) {
         }
     }
 }
-```
 
 };
 
@@ -73,7 +71,6 @@ public:
 MiddlewareChain() = default;
 ~MiddlewareChain() = default;
 
-```
 // 복사 생성자와 할당 연산자
 MiddlewareChain(const MiddlewareChain&) = default;
 MiddlewareChain& operator=(const MiddlewareChain&) = default;
@@ -128,13 +125,11 @@ void clear() {
 std::vector<std::string> get_middleware_names() const {
     return middleware_names_;
 }
-```
 
 private:
 std::vector<Middleware> middlewares_;
 std::vector<std::string> middleware_names_;
 
-```
 // 반복문 기반 체인 실행 (스택 오버플로우 방지)
 MiddlewareResult execute_chain_iterative(Request& request, Response& response, 
                                        MiddlewareContext& context) {
@@ -189,7 +184,6 @@ MiddlewareResult execute_chain_iterative(Request& request, Response& response,
     context.execute_post_hooks(request, response);
     return MiddlewareResult::COMPLETED;
 }
-```
 
 };
 
@@ -201,7 +195,6 @@ std::string pattern;
 std::regex regex;
 std::unique_ptr<MiddlewareChain> chain;
 
-```
     PatternEntry(const std::string& p) : pattern(p), regex(p), chain(std::make_unique<MiddlewareChain>()) {}
 };
 
@@ -231,7 +224,6 @@ MiddlewareResult handle(const std::string& path, Request& request, Response& res
 void clear() {
     patterns_.clear();
 }
-```
 
 private:
 std::vector<PatternEntry> patterns_;
@@ -245,7 +237,6 @@ static Middleware create_logger(const std::string& prefix = “[REQUEST]”) {
 return [prefix](Request& req, Response& res, std::function<void()> next) {
 auto start = std::chrono::steady_clock::now();
 
-```
         std::cout << prefix << " " << req.method << " " << req.path;
         if (!req.query_string.empty()) {
             std::cout << "?" << req.query_string;
@@ -404,7 +395,6 @@ static Middleware create_security_headers() {
         res.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains";
     };
 }
-```
 
 };
 
@@ -431,7 +421,6 @@ PatternMiddlewareChain pattern_middleware_chain_;
 std::unordered_map<std::string, std::unique_ptr<MiddlewareChain>> route_specific_chains_;
 mutable std::shared_mutex middleware_mutex_;
 
-```
 struct MiddlewareMetrics {
     std::atomic<uint64_t> total_middleware_executions{0};
     std::atomic<uint64_t> interrupted_chains{0};
@@ -439,12 +428,10 @@ struct MiddlewareMetrics {
     std::atomic<uint64_t> avg_middleware_time_ns{0};
     std::atomic<uint64_t> pattern_matches{0};
 } middleware_metrics_;
-```
 
 public:
 RouterWithMiddleware() = default;
 
-```
 // 글로벌 미들웨어 추가
 void add_global_middleware(Middleware middleware) {
     std::unique_lock lock(middleware_mutex_);
@@ -642,7 +629,6 @@ void clear_all_middleware() {
     pattern_middleware_chain_.clear();
     route_specific_chains_.clear();
 }
-```
 
 };
 
