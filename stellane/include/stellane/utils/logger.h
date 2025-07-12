@@ -7,12 +7,119 @@
 #include <functional>
 #include <atomic>
 #include <mutex>
+#include <shared_mutex>
 #include <thread>
 #include <queue>
 #include <condition_variable>
 #include <fstream>
+#include <cassert>
 
 namespace stellane {
+
+// ============================================================================
+// 락 계층 구조 (Lock Hierarchy) - 데드락 방지
+// ============================================================================
+
+/**
+
+- @brief 락 레벨 정의 - 낮은 번호부터 높은 번호 순서로 획득
+- 
+- 규칙:
+- 1. 항상 낮은 레벨 → 높은 레벨 순서로 락 획득
+- 1. 같은 레벨의 락은 동시에 획득하지 않음
+- 1. 디버그 모드에서 위반 시 assertion 발생
+   */
+   enum class LockLevel : int {
+   GLOBAL_CONFIG = 0,    ///< 전역 설정 (LoggerFactory)
+   LOGGER_REGISTRY = 1,  ///< 로거 레지스트리 관리
+   LOGGER_CONFIG = 2,    ///< 개별 로거 설정 (sinks, formatter)
+   LOGGER_FIELDS = 3,    ///< 구조화된 필드 수정
+   SINK_INTERNAL = 4     ///< 싱크 내부 상태 (파일 I/O 등)
+   };
+
+/**
+
+- @brief 계층적 뮤텍스 - 락 순서 검증 기능 포함
+  */
+  class HierarchicalMutex {
+  public:
+  explicit HierarchicalMutex(LockLevel level) : level_(level) {}
+  
+  void lock() {
+  check_lock_order();
+  mutex_.lock();
+  update_thread_level();
+  }
+  
+  void unlock() {
+  reset_thread_level();
+  mutex_.unlock();
+  }
+  
+  bool try_lock() {
+  if (!check_lock_order_noassert()) return false;
+  if (mutex_.try_lock()) {
+  update_thread_level();
+  return true;
+  }
+  return false;
+  }
+  
+  LockLevel level() const noexcept { return level_; }
+
+private:
+std::mutex mutex_;
+LockLevel level_;
+
+```
+// 스레드별 현재 락 레벨 추적
+static thread_local LockLevel current_thread_level_;
+
+void check_lock_order() {
+```
+
+#ifdef DEBUG
+assert(static_cast<int>(level_) > static_cast<int>(current_thread_level_) &&
+“Lock hierarchy violation detected!”);
+#endif
+}
+
+```
+bool check_lock_order_noassert() const noexcept {
+    return static_cast<int>(level_) > static_cast<int>(current_thread_level_);
+}
+
+void update_thread_level() {
+    current_thread_level_ = level_;
+}
+
+void reset_thread_level() {
+    current_thread_level_ = static_cast<LockLevel>(static_cast<int>(level_) - 1);
+}
+```
+
+};
+
+/**
+
+- @brief 계층적 뮤텍스용 RAII 락 가드
+  */
+  class HierarchicalLockGuard {
+  public:
+  explicit HierarchicalLockGuard(HierarchicalMutex& mutex) : mutex_(mutex) {
+  mutex_.lock();
+  }
+  
+  ~HierarchicalLockGuard() {
+  mutex_.unlock();
+  }
+  
+  HierarchicalLockGuard(const HierarchicalLockGuard&) = delete;
+  HierarchicalLockGuard& operator=(const HierarchicalLockGuard&) = delete;
+
+private:
+HierarchicalMutex& mutex_;
+};
 
 // ============================================================================
 // 로그 레벨 정의
@@ -28,17 +135,8 @@ FATAL = 5,
 OFF   = 6
 };
 
-/**
-
-- @brief 로그 레벨을 문자열로 변환
-  */
-  [[nodiscard]] std::string to_string(LogLevel level);
-
-/**
-
-- @brief 문자열을 로그 레벨로 변환
-  */
-  [[nodiscard]] LogLevel from_string(const std::string& level_str);
+[[nodiscard]] std::string to_string(LogLevel level);
+[[nodiscard]] LogLevel from_string(const std::string& level_str);
 
 // ============================================================================
 // 로그 메시지 구조체
@@ -71,41 +169,22 @@ LogMessage(LogLevel lvl, std::string comp, std::string trace,
 class ILogFormatter {
 public:
 virtual ~ILogFormatter() = default;
-
-```
-/**
- * @brief 로그 메시지를 포맷팅
- * @param message 로그 메시지
- * @return 포맷팅된 문자열
- */
 virtual std::string format(const LogMessage& message) = 0;
-```
-
 };
 
-/**
-
-- @brief 기본 텍스트 포매터
-- 형식: [2025-07-12T10:30:45.123Z] [INFO] [component] [trace_id] message
-  */
-  class TextFormatter : public ILogFormatter {
-  public:
-  explicit TextFormatter(bool include_thread_id = false);
-  std::string format(const LogMessage& message) override;
+class TextFormatter : public ILogFormatter {
+public:
+explicit TextFormatter(bool include_thread_id = false);
+std::string format(const LogMessage& message) override;
 
 private:
 bool include_thread_id_;
 };
 
-/**
-
-- @brief JSON 포매터 (구조화된 로깅)
-- {“timestamp”:“2025-07-12T10:30:45.123Z”,“level”:“INFO”,“component”:“stellane”,“trace_id”:“abc-123”,“message”:“test”}
-  */
-  class JsonFormatter : public ILogFormatter {
-  public:
-  explicit JsonFormatter(bool pretty_print = false);
-  std::string format(const LogMessage& message) override;
+class JsonFormatter : public ILogFormatter {
+public:
+explicit JsonFormatter(bool pretty_print = false);
+std::string format(const LogMessage& message) override;
 
 private:
 bool pretty_print_;
@@ -118,35 +197,19 @@ bool pretty_print_;
 class ILogSink {
 public:
 virtual ~ILogSink() = default;
-
-```
-/**
- * @brief 로그 메시지 출력
- * @param formatted_message 포맷팅된 로그 메시지
- */
 virtual void write(const std::string& formatted_message) = 0;
-
-/**
- * @brief 버퍼 플러시 (즉시 출력)
- */
 virtual void flush() = 0;
-```
-
 };
 
-/**
-
-- @brief 콘솔 출력 싱크
-  */
-  class ConsoleSink : public ILogSink {
-  public:
-  explicit ConsoleSink(bool use_colors = true);
-  void write(const std::string& formatted_message) override;
-  void flush() override;
+class ConsoleSink : public ILogSink {
+public:
+explicit ConsoleSink(bool use_colors = true);
+void write(const std::string& formatted_message) override;
+void flush() override;
 
 private:
 bool use_colors_;
-std::mutex mutex_;  // 멀티스레드 안전성
+HierarchicalMutex mutex_{LockLevel::SINK_INTERNAL};
 
 ```
 std::string get_color_code(LogLevel level) const;
@@ -154,29 +217,21 @@ std::string get_color_code(LogLevel level) const;
 
 };
 
-/**
+class FileSink : public ILogSink {
+public:
+explicit FileSink(const std::string& filename, bool append = true);
+~FileSink();
 
-- @brief 파일 출력 싱크
-  */
-  class FileSink : public ILogSink {
-  public:
-  explicit FileSink(const std::string& filename, bool append = true);
-  ~FileSink();
-  
-  void write(const std::string& formatted_message) override;
-  void flush() override;
-  
-  /**
-  - @brief 로그 파일 로테이션
-  - @param max_size_mb 최대 파일 크기 (MB)
-  - @param max_files 보관할 파일 개수
-    */
-    void enable_rotation(size_t max_size_mb = 100, size_t max_files = 10);
+```
+void write(const std::string& formatted_message) override;
+void flush() override;
+void enable_rotation(size_t max_size_mb = 100, size_t max_files = 10);
+```
 
 private:
 std::string filename_;
 std::ofstream file_;
-std::mutex mutex_;
+HierarchicalMutex mutex_{LockLevel::SINK_INTERNAL};
 
 ```
 // 로테이션 설정
@@ -191,31 +246,25 @@ void perform_rotation();
 
 };
 
-/**
+class AsyncSink : public ILogSink {
+public:
+explicit AsyncSink(std::shared_ptr<ILogSink> underlying_sink,
+size_t buffer_size = 1000);
+~AsyncSink();
 
-- @brief 비동기 로그 싱크 (고성능)
-  */
-  class AsyncSink : public ILogSink {
-  public:
-  explicit AsyncSink(std::shared_ptr<ILogSink> underlying_sink,
-  size_t buffer_size = 1000);
-  ~AsyncSink();
-  
-  void write(const std::string& formatted_message) override;
-  void flush() override;
-  
-  /**
-  - @brief 큐에 대기 중인 로그 개수
-    */
-    [[nodiscard]] size_t pending_count() const;
+```
+void write(const std::string& formatted_message) override;
+void flush() override;
+[[nodiscard]] size_t pending_count() const;
+```
 
 private:
 std::shared_ptr<ILogSink> underlying_sink_;
 
 ```
-// 비동기 처리
+// 비동기 처리 - 별도 스레드에서 실행되므로 독립적인 락 사용
 std::queue<std::string> message_queue_;
-mutable std::mutex queue_mutex_;
+mutable std::mutex queue_mutex_;  // 표준 뮤텍스 사용 (스레드 간 통신)
 std::condition_variable queue_cv_;
 std::thread worker_thread_;
 std::atomic<bool> stop_flag_{false};
@@ -227,256 +276,166 @@ void worker_loop();
 };
 
 // ============================================================================
-// 메인 Logger 클래스
+// 메인 Logger 클래스 (개선된 버전)
 // ============================================================================
 
 /**
 
-- @brief Stellane의 구조화된 로거
+- @brief 데드락 방지 Logger - 계층적 락 구조 적용
 - 
-- 특징:
-- - 다중 싱크 지원 (콘솔 + 파일 동시 출력 가능)
-- - 구조화된 필드 지원 (key-value 쌍)
-- - Trace ID 자동 포함
-- - 비동기 로깅 지원 (고성능)
-- - Thread-safe
+- 락 순서:
+- 1. config_mutex_ (LOGGER_CONFIG) - 싱크/포매터 설정
+- 1. fields_mutex_ (LOGGER_FIELDS) - 구조화된 필드
 - 
-- @example
-- ```cpp
+- 주의: do_log()에서는 읽기 전용 접근만 수행하여 락 충돌 최소화
+  */
+  class Logger {
+  public:
+  explicit Logger(std::string component, std::string trace_id = “”);
   
-  ```
-- Logger logger(“auth_service”, “trace-123”);
-- logger.info(“User login successful”);
-- logger.with_field(“user_id”, “42”)
-- ```
-    .with_field("ip", "192.168.1.1")
-  ```
-- ```
-    .warn("Suspicious login attempt");
-  ```
-- ```
+  // 복사/이동 생성자 - 락 순서 유지
+  Logger(const Logger& other);
+  Logger& operator=(const Logger& other);
+  Logger(Logger&& other) noexcept;
+  Logger& operator=(Logger&& other) noexcept;
   
-  ```
-
-*/
-class Logger {
-public:
-/**
-* @brief Logger 생성자
-* @param component 컴포넌트 이름 (예: “stellane”, “auth_service”)
-* @param trace_id 추적 ID (Context에서 전달)
-*/
-explicit Logger(std::string component, std::string trace_id = “”);
-
-```
-/**
- * @brief 복사 생성자
- */
-Logger(const Logger& other);
-Logger& operator=(const Logger& other);
-
-/**
- * @brief 이동 생성자
- */
-Logger(Logger&& other) noexcept;
-Logger& operator=(Logger&& other) noexcept;
-
-/**
- * @brief 소멸자
- */
-~Logger();
-
-// ========================================================================
-// 로그 레벨별 메서드
-// ========================================================================
-
-void trace(const std::string& message);
-void debug(const std::string& message);
-void info(const std::string& message);
-void warn(const std::string& message);
-void error(const std::string& message);
-void fatal(const std::string& message);
-
-/**
- * @brief 지정된 레벨로 로그 출력
- * @param level 로그 레벨
- * @param message 메시지
- */
-void log(LogLevel level, const std::string& message);
-
-// ========================================================================
-// 구조화된 로깅 (Fluent Interface)
-// ========================================================================
-
-/**
- * @brief 구조화된 필드 추가
- * @param key 필드 키
- * @param value 필드 값
- * @return Logger& (체이닝 가능)
- * 
- * @example
- * ```cpp
- * logger.with_field("user_id", "123")
- *       .with_field("action", "login")
- *       .info("User action performed");
- * ```
- */
-Logger& with_field(const std::string& key, const std::string& value);
-
-/**
- * @brief 숫자 필드 추가
- */
-template<typename T>
-Logger& with_field(const std::string& key, T value);
-
-/**
- * @brief 모든 구조화된 필드 제거
- */
-Logger& clear_fields();
-
-// ========================================================================
-// 설정 메서드
-// ========================================================================
-
-/**
- * @brief 최소 로그 레벨 설정
- * @param level 이 레벨 이상만 출력
- */
-void set_level(LogLevel level);
-
-/**
- * @brief 현재 최소 로그 레벨 반환
- */
-[[nodiscard]] LogLevel get_level() const;
-
-/**
- * @brief 특정 레벨이 활성화되어 있는지 확인
- * @param level 확인할 레벨
- * @return 활성화 여부
- */
-[[nodiscard]] bool is_enabled(LogLevel level) const;
-
-/**
- * @brief 로그 싱크 추가
- * @param sink 출력 대상
- */
-void add_sink(std::shared_ptr<ILogSink> sink);
-
-/**
- * @brief 모든 싱크 제거
- */
-void clear_sinks();
-
-/**
- * @brief 포매터 설정
- * @param formatter 로그 포맷터
- */
-void set_formatter(std::shared_ptr<ILogFormatter> formatter);
-
-/**
- * @brief 즉시 플러시 (모든 싱크)
- */
-void flush();
-
-// ========================================================================
-// 메타데이터 접근
-// ========================================================================
-
-/**
- * @brief 컴포넌트 이름 반환
- */
-[[nodiscard]] const std::string& component() const;
-
-/**
- * @brief Trace ID 반환
- */
-[[nodiscard]] const std::string& trace_id() const;
-
-/**
- * @brief Trace ID 변경
- * @param new_trace_id 새로운 추적 ID
- */
-void set_trace_id(const std::string& new_trace_id);
-```
+  ~Logger();
+  
+  // ========================================================================
+  // 로그 레벨별 메서드
+  // ========================================================================
+  
+  void trace(const std::string& message);
+  void debug(const std::string& message);
+  void info(const std::string& message);
+  void warn(const std::string& message);
+  void error(const std::string& message);
+  void fatal(const std::string& message);
+  void log(LogLevel level, const std::string& message);
+  
+  // ========================================================================
+  // 구조화된 로깅 (Fluent Interface)
+  // ========================================================================
+  
+  Logger& with_field(const std::string& key, const std::string& value);
+  
+  template<typename T>
+  Logger& with_field(const std::string& key, T value);
+  
+  Logger& clear_fields();
+  
+  // ========================================================================
+  // 설정 메서드 - 계층적 락 적용
+  // ========================================================================
+  
+  void set_level(LogLevel level);
+  [[nodiscard]] LogLevel get_level() const;
+  [[nodiscard]] bool is_enabled(LogLevel level) const;
+  
+  /**
+  - @brief 싱크 추가 - LOGGER_CONFIG 레벨 락 사용
+    */
+    void add_sink(std::shared_ptr<ILogSink> sink);
+    void clear_sinks();
+    void set_formatter(std::shared_ptr<ILogFormatter> formatter);
+    void flush();
+  
+  // ========================================================================
+  // 메타데이터 접근
+  // ========================================================================
+  
+  [[nodiscard]] const std::string& component() const;
+  [[nodiscard]] const std::string& trace_id() const;
+  void set_trace_id(const std::string& new_trace_id);
 
 private:
+// 불변 데이터 (락 불필요)
 std::string component_;
 std::string trace_id_;
 std::atomic<LogLevel> min_level_{LogLevel::INFO};
 
 ```
-// 구조화된 필드 (thread-local로 관리될 수 있음)
+// 구조화된 필드 - LOGGER_FIELDS 레벨
 std::unordered_map<std::string, std::string> fields_;
-mutable std::mutex fields_mutex_;
+HierarchicalMutex fields_mutex_{LockLevel::LOGGER_FIELDS};
 
-// 출력 관련
+// 설정 데이터 - LOGGER_CONFIG 레벨
 std::vector<std::shared_ptr<ILogSink>> sinks_;
 std::shared_ptr<ILogFormatter> formatter_;
-mutable std::mutex sinks_mutex_;
+HierarchicalMutex config_mutex_{LockLevel::LOGGER_CONFIG};
 
 /**
- * @brief 실제 로그 출력 수행
- * @param level 로그 레벨
- * @param message 메시지
+ * @brief 실제 로그 출력 - 락 순서 최적화
+ * 
+ * 1. fields 스냅샷 생성 (짧은 락)
+ * 2. config 스냅샷 생성 (짧은 락) 
+ * 3. 락 해제 후 실제 출력 수행
  */
 void do_log(LogLevel level, const std::string& message);
+
+/**
+ * @brief 안전한 복사 구현 - 락 순서 보장
+ */
+void safe_copy_from(const Logger& other);
 ```
 
 };
 
 // ============================================================================
-// 전역 로거 관리
+// 전역 로거 관리 - 계층적 락 적용
 // ============================================================================
 
-/**
+class LoggerFactory {
+public:
+static Logger& get_default();
+static Logger& get_logger(const std::string& component);
 
-- @brief 로거 팩토리 및 전역 관리자
-  */
-  class LoggerFactory {
-  public:
-  /**
-  - @brief 기본 로거 반환
-  - @return 전역 기본 로거
-    */
-    static Logger& get_default();
-  
-  /**
-  - @brief 컴포넌트별 로거 생성/반환
-  - @param component 컴포넌트 이름
-  - @return 컴포넌트 전용 로거
-    */
-    static Logger& get_logger(const std::string& component);
-  
-  /**
-  - @brief 전역 설정 적용
-  - @param level 모든 로거의 최소 레벨
-    */
-    static void set_global_level(LogLevel level);
-  
-  /**
-  - @brief 기본 싱크 설정 (새로 생성되는 로거에 적용)
-  - @param sink 기본 출력 대상
-    */
-    static void set_default_sink(std::shared_ptr<ILogSink> sink);
-  
-  /**
-  - @brief 기본 포매터 설정
-  - @param formatter 기본 포맷터
-    */
-    static void set_default_formatter(std::shared_ptr<ILogFormatter> formatter);
-  
-  /**
-  - @brief 모든 로거 플러시
-    */
-    static void flush_all();
+```
+// 전역 설정 - GLOBAL_CONFIG 레벨 락
+static void set_global_level(LogLevel level);
+static void set_default_sink(std::shared_ptr<ILogSink> sink);
+static void set_default_formatter(std::shared_ptr<ILogFormatter> formatter);
+static void flush_all();
+```
 
 private:
+// 레지스트리 관리 - LOGGER_REGISTRY 레벨
 static std::unordered_map<std::string, std::unique_ptr<Logger>> loggers_;
-static std::mutex loggers_mutex_;
+static HierarchicalMutex registry_mutex_;
+
+```
+// 기본 설정 - GLOBAL_CONFIG 레벨
 static std::shared_ptr<ILogSink> default_sink_;
 static std::shared_ptr<ILogFormatter> default_formatter_;
-static LogLevel global_level_;
+static std::atomic<LogLevel> global_level_;
+static HierarchicalMutex config_mutex_;
+```
+
 };
+
+// ============================================================================
+// 템플릿 구현
+// ============================================================================
+
+template<typename T>
+Logger& Logger::with_field(const std::string& key, T value) {
+HierarchicalLockGuard lock(fields_mutex_);
+
+```
+if constexpr (std::is_arithmetic_v<T>) {
+    fields_[key] = std::to_string(value);
+} else if constexpr (std::is_same_v<T, std::string>) {
+    fields_[key] = value;
+} else if constexpr (std::is_convertible_v<T, std::string>) {
+    fields_[key] = std::string(value);
+} else {
+    static_assert(false, "Type not supported for logging field");
+}
+
+return *this;
+```
+
+}
 
 // ============================================================================
 // 편의 매크로 (선택적 사용)
@@ -502,40 +461,6 @@ do { if ((logger).is_enabled(::stellane::LogLevel::ERROR)) (logger).error(msg); 
 #define STELLANE_FATAL(logger, msg)   
 do { if ((logger).is_enabled(::stellane::LogLevel::FATAL)) (logger).fatal(msg); } while(0)
 
-// 구조화된 로깅 매크로
-#define STELLANE_LOG_WITH_FIELDS(logger, level, msg, …)   
-do {   
-if ((logger).is_enabled(level)) {   
-auto temp_logger = logger;   
-**VA_ARGS**;   
-temp_logger.log(level, msg);   
-}   
-} while(0)
-
 #endif // STELLANE_ENABLE_LOG_MACROS
-
-// ============================================================================
-// 템플릿 구현
-// ============================================================================
-
-template<typename T>
-Logger& Logger::with_field(const std::string& key, T value) {
-std::lock_guard<std::mutex> lock(fields_mutex_);
-
-```
-if constexpr (std::is_arithmetic_v<T>) {
-    fields_[key] = std::to_string(value);
-} else if constexpr (std::is_same_v<T, std::string>) {
-    fields_[key] = value;
-} else if constexpr (std::is_convertible_v<T, std::string>) {
-    fields_[key] = std::string(value);
-} else {
-    static_assert(false, "Type not supported for logging field");
-}
-
-return *this;
-```
-
-}
 
 } // namespace stellane
