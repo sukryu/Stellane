@@ -296,7 +296,7 @@ std::optional<T> Context::extract_value(const std::any& value) const {
 try {
 // 정확한 타입 매칭 시도
 if (value.type() == typeid(T)) {
-return std::any_cast<T>(value);
+return std::any_cast<const T&>(value);
 }
 
 ```
