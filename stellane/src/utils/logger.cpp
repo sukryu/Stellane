@@ -9,6 +9,13 @@
 namespace stellane {
 
 // ============================================================================
+// 계층적 뮤텍스 구현
+// ============================================================================
+
+// 스레드별 현재 락 레벨 추적
+thread_local LockLevel HierarchicalMutex::current_thread_level_ = static_cast<LockLevel>(-1);
+
+// ============================================================================
 // LogLevel 유틸리티 함수
 // ============================================================================
 
@@ -232,12 +239,12 @@ ConsoleSink::ConsoleSink(bool use_colors)
 }
 
 void ConsoleSink::write(const std::string& formatted_message) {
-std::lock_guard<std::mutex> lock(mutex_);
+HierarchicalLockGuard lock(mutex_);
 std::cout << formatted_message << std::endl;
 }
 
 void ConsoleSink::flush() {
-std::lock_guard<std::mutex> lock(mutex_);
+HierarchicalLockGuard lock(mutex_);
 std::cout.flush();
 }
 
@@ -288,13 +295,14 @@ if (std::filesystem::exists(filename_)) {
 }
 
 FileSink::~FileSink() {
+HierarchicalLockGuard lock(mutex_);
 if (file_.is_open()) {
 file_.close();
 }
 }
 
 void FileSink::write(const std::string& formatted_message) {
-std::lock_guard<std::mutex> lock(mutex_);
+HierarchicalLockGuard lock(mutex_);
 
 ```
 if (!file_.is_open()) return;
@@ -310,14 +318,14 @@ if (rotation_enabled_) {
 }
 
 void FileSink::flush() {
-std::lock_guard<std::mutex> lock(mutex_);
+HierarchicalLockGuard lock(mutex_);
 if (file_.is_open()) {
 file_.flush();
 }
 }
 
 void FileSink::enable_rotation(size_t max_size_mb, size_t max_files) {
-std::lock_guard<std::mutex> lock(mutex_);
+HierarchicalLockGuard lock(mutex_);
 rotation_enabled_ = true;
 max_size_bytes_ = max_size_mb * 1024 * 1024;
 max_files_ = max_files;
@@ -460,7 +468,7 @@ while (!message_queue_.empty() && underlying_sink_) {
 }
 
 // ============================================================================
-// Logger 구현
+// Logger 구현 - 데드락 방지 버전
 // ============================================================================
 
 Logger::Logger(std::string component, std::string trace_id)
@@ -475,53 +483,34 @@ add_sink(std::make_shared<ConsoleSink>());
 
 }
 
-Logger::Logger(const Logger& other)
-: component_(other.component_)
-, trace_id_(other.trace_id_)
-, min_level_(other.min_level_.load())
-, fields_(other.fields_)
-, formatter_(other.formatter_) {
-
-```
-std::lock_guard<std::mutex> lock(other.sinks_mutex_);
-sinks_ = other.sinks_;
-```
-
+Logger::Logger(const Logger& other) {
+safe_copy_from(other);
 }
 
 Logger& Logger::operator=(const Logger& other) {
 if (this != &other) {
-component_ = other.component_;
-trace_id_ = other.trace_id_;
-min_level_ = other.min_level_.load();
-
-```
-    {
-        std::lock_guard<std::mutex> lock1(fields_mutex_);
-        std::lock_guard<std::mutex> lock2(other.fields_mutex_);
-        fields_ = other.fields_;
-    }
-    
-    formatter_ = other.formatter_;
-    
-    {
-        std::lock_guard<std::mutex> lock1(sinks_mutex_);
-        std::lock_guard<std::mutex> lock2(other.sinks_mutex_);
-        sinks_ = other.sinks_;
-    }
+safe_copy_from(other);
 }
 return *this;
-```
-
 }
 
 Logger::Logger(Logger&& other) noexcept
 : component_(std::move(other.component_))
 , trace_id_(std::move(other.trace_id_))
-, min_level_(other.min_level_.load())
-, fields_(std::move(other.fields_))
-, sinks_(std::move(other.sinks_))
-, formatter_(std::move(other.formatter_)) {
+, min_level_(other.min_level_.load()) {
+
+```
+// 계층적 락 순서로 이동
+{
+    HierarchicalLockGuard config_lock(other.config_mutex_);
+    HierarchicalLockGuard fields_lock(other.fields_mutex_);
+    
+    sinks_ = std::move(other.sinks_);
+    formatter_ = std::move(other.formatter_);
+    fields_ = std::move(other.fields_);
+}
+```
+
 }
 
 Logger& Logger::operator=(Logger&& other) noexcept {
@@ -529,16 +518,57 @@ if (this != &other) {
 component_ = std::move(other.component_);
 trace_id_ = std::move(other.trace_id_);
 min_level_ = other.min_level_.load();
-fields_ = std::move(other.fields_);
-sinks_ = std::move(other.sinks_);
-formatter_ = std::move(other.formatter_);
+
+```
+    // 계층적 락 순서로 이동
+    {
+        HierarchicalLockGuard config_lock(config_mutex_);
+        HierarchicalLockGuard fields_lock(fields_mutex_);
+        HierarchicalLockGuard other_config_lock(other.config_mutex_);
+        HierarchicalLockGuard other_fields_lock(other.fields_mutex_);
+        
+        sinks_ = std::move(other.sinks_);
+        formatter_ = std::move(other.formatter_);
+        fields_ = std::move(other.fields_);
+    }
 }
 return *this;
+```
+
 }
 
 Logger::~Logger() {
 flush();
 }
+
+void Logger::safe_copy_from(const Logger& other) {
+component_ = other.component_;
+trace_id_ = other.trace_id_;
+min_level_ = other.min_level_.load();
+
+```
+// 계층적 락 순서로 복사 (데드락 방지)
+{
+    HierarchicalLockGuard other_config_lock(const_cast<Logger&>(other).config_mutex_);
+    HierarchicalLockGuard config_lock(config_mutex_);
+    
+    sinks_ = other.sinks_;
+    formatter_ = other.formatter_;
+}
+
+{
+    HierarchicalLockGuard other_fields_lock(const_cast<Logger&>(other).fields_mutex_);
+    HierarchicalLockGuard fields_lock(fields_mutex_);
+    
+    fields_ = other.fields_;
+}
+```
+
+}
+
+// ========================================================================
+// 로그 레벨별 메서드
+// ========================================================================
 
 void Logger::trace(const std::string& message) {
 log(LogLevel::TRACE, message);
@@ -575,17 +605,25 @@ do_log(level, message);
 
 }
 
+// ========================================================================
+// 구조화된 로깅
+// ========================================================================
+
 Logger& Logger::with_field(const std::string& key, const std::string& value) {
-std::lock_guard<std::mutex> lock(fields_mutex_);
+HierarchicalLockGuard lock(fields_mutex_);
 fields_[key] = value;
 return *this;
 }
 
 Logger& Logger::clear_fields() {
-std::lock_guard<std::mutex> lock(fields_mutex_);
+HierarchicalLockGuard lock(fields_mutex_);
 fields_.clear();
 return *this;
 }
+
+// ========================================================================
+// 설정 메서드
+// ========================================================================
 
 void Logger::set_level(LogLevel level) {
 min_level_ = level;
@@ -603,31 +641,49 @@ void Logger::add_sink(std::shared_ptr<ILogSink> sink) {
 if (!sink) return;
 
 ```
-std::lock_guard<std::mutex> lock(sinks_mutex_);
+HierarchicalLockGuard lock(config_mutex_);
 sinks_.push_back(std::move(sink));
 ```
 
 }
 
 void Logger::clear_sinks() {
-std::lock_guard<std::mutex> lock(sinks_mutex_);
+HierarchicalLockGuard lock(config_mutex_);
 sinks_.clear();
 }
 
 void Logger::set_formatter(std::shared_ptr<ILogFormatter> formatter) {
-if (formatter) {
+if (!formatter) return;
+
+```
+HierarchicalLockGuard lock(config_mutex_);
 formatter_ = std::move(formatter);
-}
+```
+
 }
 
 void Logger::flush() {
-std::lock_guard<std::mutex> lock(sinks_mutex_);
-for (auto& sink : sinks_) {
-if (sink) {
-sink->flush();
+// 설정 스냅샷 생성 (짧은 락)
+std::vector<std::shared_ptr<ILogSink>> sinks_snapshot;
+{
+HierarchicalLockGuard lock(config_mutex_);
+sinks_snapshot = sinks_;
 }
+
+```
+// 락 해제 후 플러시 수행
+for (auto& sink : sinks_snapshot) {
+    if (sink) {
+        sink->flush();
+    }
 }
+```
+
 }
+
+// ========================================================================
+// 메타데이터 접근
+// ========================================================================
 
 const std::string& Logger::component() const {
 return component_;
@@ -641,30 +697,47 @@ void Logger::set_trace_id(const std::string& new_trace_id) {
 trace_id_ = new_trace_id;
 }
 
-void Logger::do_log(LogLevel level, const std::string& message) {
-// 로그 메시지 생성
-LogMessage log_msg(level, component_, trace_id_, message);
+// ========================================================================
+// 핵심 로깅 구현 - 최적화된 락 사용
+// ========================================================================
 
-```
-// 구조화된 필드 복사
+void Logger::do_log(LogLevel level, const std::string& message) {
+// 1. 필드 스냅샷 생성 (짧은 락)
+std::unordered_map<std::string, std::string> fields_snapshot;
 {
-    std::lock_guard<std::mutex> lock(fields_mutex_);
-    log_msg.fields = fields_;
+HierarchicalLockGuard lock(fields_mutex_);
+fields_snapshot = fields_;
 }
 
-// 포맷팅
+```
+// 2. 설정 스냅샷 생성 (짧은 락)
+std::vector<std::shared_ptr<ILogSink>> sinks_snapshot;
+std::shared_ptr<ILogFormatter> formatter_snapshot;
+{
+    HierarchicalLockGuard lock(config_mutex_);
+    sinks_snapshot = sinks_;
+    formatter_snapshot = formatter_;
+}
+
+// 3. 락 해제 후 로그 메시지 생성 및 출력
+LogMessage log_msg(level, component_, trace_id_, message);
+log_msg.fields = std::move(fields_snapshot);
+
 std::string formatted_message;
-if (formatter_) {
-    formatted_message = formatter_->format(log_msg);
+if (formatter_snapshot) {
+    formatted_message = formatter_snapshot->format(log_msg);
 } else {
     formatted_message = message;
 }
 
-// 모든 싱크에 출력
-std::lock_guard<std::mutex> lock(sinks_mutex_);
-for (auto& sink : sinks_) {
+// 4. 모든 싱크에 출력 (락 없음)
+for (auto& sink : sinks_snapshot) {
     if (sink) {
-        sink->write(formatted_message);
+        try {
+            sink->write(formatted_message);
+        } catch (...) {
+            // 싱크 출력 실패 시 계속 진행 (로깅 시스템 안정성)
+        }
     }
 }
 ```
@@ -672,21 +745,22 @@ for (auto& sink : sinks_) {
 }
 
 // ============================================================================
-// LoggerFactory 구현
+// LoggerFactory 구현 - 정적 멤버 초기화
 // ============================================================================
 
 std::unordered_map<std::string, std::unique_ptr<Logger>> LoggerFactory::loggers_;
-std::mutex LoggerFactory::loggers_mutex_;
+HierarchicalMutex LoggerFactory::registry_mutex_{LockLevel::LOGGER_REGISTRY};
 std::shared_ptr<ILogSink> LoggerFactory::default_sink_;
 std::shared_ptr<ILogFormatter> LoggerFactory::default_formatter_;
-LogLevel LoggerFactory::global_level_ = LogLevel::INFO;
+std::atomic<LogLevel> LoggerFactory::global_level_{LogLevel::INFO};
+HierarchicalMutex LoggerFactory::config_mutex_{LockLevel::GLOBAL_CONFIG};
 
 Logger& LoggerFactory::get_default() {
 return get_logger(“stellane”);
 }
 
 Logger& LoggerFactory::get_logger(const std::string& component) {
-std::lock_guard<std::mutex> lock(loggers_mutex_);
+HierarchicalLockGuard lock(registry_mutex_);
 
 ```
 auto it = loggers_.find(component);
@@ -696,15 +770,20 @@ if (it != loggers_.end()) {
 
 // 새 로거 생성
 auto logger = std::make_unique<Logger>(component);
-logger->set_level(global_level_);
+logger->set_level(global_level_.load());
 
-if (default_sink_) {
-    logger->clear_sinks();
-    logger->add_sink(default_sink_);
-}
-
-if (default_formatter_) {
-    logger->set_formatter(default_formatter_);
+// 기본 설정 적용
+{
+    HierarchicalLockGuard config_lock(config_mutex_);
+    
+    if (default_sink_) {
+        logger->clear_sinks();
+        logger->add_sink(default_sink_);
+    }
+    
+    if (default_formatter_) {
+        logger->set_formatter(default_formatter_);
+    }
 }
 
 Logger& logger_ref = *logger;
@@ -716,10 +795,12 @@ return logger_ref;
 }
 
 void LoggerFactory::set_global_level(LogLevel level) {
-std::lock_guard<std::mutex> lock(loggers_mutex_);
-global_level_ = level;
+HierarchicalLockGuard config_lock(config_mutex_);
+HierarchicalLockGuard registry_lock(registry_mutex_);
 
 ```
+global_level_ = level;
+
 // 기존 로거들에도 적용
 for (auto& [name, logger] : loggers_) {
     logger->set_level(level);
@@ -729,20 +810,24 @@ for (auto& [name, logger] : loggers_) {
 }
 
 void LoggerFactory::set_default_sink(std::shared_ptr<ILogSink> sink) {
-std::lock_guard<std::mutex> lock(loggers_mutex_);
+HierarchicalLockGuard lock(config_mutex_);
 default_sink_ = std::move(sink);
 }
 
 void LoggerFactory::set_default_formatter(std::shared_ptr<ILogFormatter> formatter) {
-std::lock_guard<std::mutex> lock(loggers_mutex_);
+HierarchicalLockGuard lock(config_mutex_);
 default_formatter_ = std::move(formatter);
 }
 
 void LoggerFactory::flush_all() {
-std::lock_guard<std::mutex> lock(loggers_mutex_);
+HierarchicalLockGuard lock(registry_mutex_);
+
+```
 for (auto& [name, logger] : loggers_) {
-logger->flush();
+    logger->flush();
 }
+```
+
 }
 
 } // namespace stellane
