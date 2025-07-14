@@ -63,7 +63,8 @@ func CreateUser(ctx *Context, req CreateUserRequest, auth AuthInfo) (*User, erro
 
 ### ⚡ **Performance Excellence**
 
-- **Hybrid Routing Engine**: Static routes O(1), dynamic routes optimized with compiled regex
+- **Advanced Hybrid Routing**: Static routes with Prefix Trie O(k), dynamic routes with Radix Trie for O(log n) performance
+- **Scalable Architecture**: Handles exponential route growth with consistent performance guarantees
 - **Memory Efficiency**: Zero-copy networking and object pooling reduce GC pressure
 - **Concurrent Optimization**: Work-stealing schedulers and connection affinity
 - **Progressive Enhancement**: Pure Go foundation with optional C++ acceleration
@@ -154,7 +155,7 @@ Stellane-Go implements a **hybrid performance model** inspired by successful fra
 │                 Pure Go Runtime (Phase 1)               │
 │  ┌─────────────────┐ ┌─────────────────┐               │
 │  │ Hybrid Router   │ │ Context Manager │               │
-│  │ Trie + Regex    │ │  + Middleware   │               │
+│  │Prefix+Radix Trie│ │  + Middleware   │               │
 │  └─────────────────┘ └─────────────────┘               │
 ├─────────────────────────────────────────────────────────┤
 │              C++ Performance Core (Phase 2)             │
@@ -314,7 +315,7 @@ request_size_limit = "32MB"
 
 ### Phase 1: Pure Go Foundation ✅ *In Progress*
 
-- [x] Hybrid routing system (Trie + Regex)
+- [x] Advanced hybrid routing (Prefix Trie + Radix Trie)
 - [x] Type-safe parameter injection
 - [x] Automatic validation and serialization
 - [x] Middleware chain system
